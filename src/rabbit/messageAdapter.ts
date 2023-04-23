@@ -2,10 +2,10 @@ import { QueueOptions, RabbitHandlerConfig } from '@golevelup/nestjs-rabbitmq';
 import { IMessage } from 'src/messages/message';
 import { Logger } from '@nestjs/common';
 import { Channel, ConsumeMessage } from 'amqplib';
+import { IMessageHandleSubscribe } from './message';
 
-export const MessageToQueueDefAdapter = <T extends IMessage>(
-  input: any,
-  queueIntent: string,
+export const MessageToQueueDefAdapter = <T extends IMessageHandleSubscribe>(
+  input: IMessageHandleSubscribe,
 ): Pick<
   RabbitHandlerConfig,
   | 'queue'
@@ -19,20 +19,20 @@ export const MessageToQueueDefAdapter = <T extends IMessage>(
   | 'errorHandler'
   | 'allowNonJsonMessages'
 > => {
-  const msg: IMessage = new input();
-  const queueName = `${msg.entityName}-${queueIntent}-v${msg.version}`;
-  const preRetryExchange = `${queueName}-pre-retry`;
+  const queueName = input.queue;
+  const exchangeName = input.exchange;
+  const deadDirectExchange = `${queueName}-dead-direct-exchange`;
 
   return {
-    message: msg,
+    message: input,
     queue: queueName,
-    exchange: msg.entityName,
-    routingKey: msg.getRoutingKey(),
+    exchange: exchangeName,
+    routingKey: input.routingKey,
     errorHandler: (ch: Channel, message: ConsumeMessage, err: Error) => {
       if (
         message.properties.headers &&
         message.properties.headers['x-death'] &&
-        message.properties.headers['x-death'][0].count > 1
+        message.properties.headers['x-death'][0].count >= 3
       ) {
         Logger.warn(
           `dropping message. routing key: "${
@@ -40,12 +40,7 @@ export const MessageToQueueDefAdapter = <T extends IMessage>(
           }" \r\n content: ${message.content.toString()} during: ${err}`,
         );
 
-        if (message.properties.headers['x-death'][0].count > 5) {
-          ch.ack(message, false);
-          ch.sendToQueue(msg.entityName + '-failed', message.content, {});
-        } else {
-          ch.nack(message, false, false);
-        }
+        ch.ack(message, false);
       } else {
         ch.nack(message, false, false);
       }
@@ -59,11 +54,12 @@ export const MessageToQueueDefAdapter = <T extends IMessage>(
       Logger.warn(queueName, error);
     },
     queueOptions: {
-      deadLetterExchange: preRetryExchange,
-      deadLetterRoutingKey: msg.getRoutingKey(),
+      deadLetterExchange: deadDirectExchange,
+      deadLetterRoutingKey: input.routingKey,
       durable: true,
       exclusive: false,
       autoDelete: false,
+      messageTtl: 60000,
     },
     createQueueIfNotExists: true,
   } as any;

@@ -13,7 +13,7 @@ import {
 import { ExternalContextCreator } from '@nestjs/core/helpers/external-context-creator';
 import { ChannelWrapper } from 'amqp-connection-manager';
 import { Channel } from 'amqplib';
-import { IMessage } from 'src/messages/message';
+import { IMessageHandleSubscribe } from './message';
 
 @Module({})
 export class MqModule extends RabbitMQModule implements OnApplicationBootstrap {
@@ -55,25 +55,10 @@ export class MqModule extends RabbitMQModule implements OnApplicationBootstrap {
 
         for (const exchangeName in groupedByExchange) {
           const queueMetas = groupedByExchange[exchangeName];
-          const unRoutedExchange = exchangeName + '-unrouted';
-          await channel.assertExchange(unRoutedExchange, 'fanout', {
-            durable: true,
-            autoDelete: false,
-          });
           await channel.assertExchange(exchangeName, 'topic', {
             durable: true,
             autoDelete: false,
-            alternateExchange: unRoutedExchange,
           });
-          await channel.assertQueue(unRoutedExchange, {
-            durable: true,
-            autoDelete: false,
-          });
-          await channel.assertQueue(exchangeName + '-failed', {
-            durable: true,
-            autoDelete: false,
-          });
-          await channel.bindQueue(unRoutedExchange, unRoutedExchange, '*');
 
           for (const index in queueMetas) {
             const item = queueMetas[
@@ -81,28 +66,35 @@ export class MqModule extends RabbitMQModule implements OnApplicationBootstrap {
             ] as DiscoveredMethodWithMeta<RabbitHandlerConfig>;
             const queueMeta = item.meta;
             const queueName = queueMeta.queue;
-            const msg = (queueMeta as any).message as IMessage;
+            const msg = (queueMeta as any).message as IMessageHandleSubscribe;
 
-            const waitQueueName = queueName + `-retry-queue`;
-            const preRetryExchange = `${queueName}-pre-retry`;
-            const retryExchange = `${queueName}-retry`;
+            const deadQueueName = queueName + `-dead-queue`;
+            const deadDirectExchange = `${queueName}-dead-direct-exchange`;
 
-            await channel.assertExchange(preRetryExchange, 'direct');
-            await channel.assertExchange(retryExchange, 'direct');
-
-            await channel.assertQueue(waitQueueName, {
+            await channel.assertQueue(deadQueueName, {
               durable: true,
-              deadLetterExchange: retryExchange,
-              arguments: { 'x-message-ttl': 10_000 },
+              autoDelete: false,
+              messageTtl: 60000,
             });
 
+            await channel.assertQueue(queueName, {
+              durable: true,
+              autoDelete: false,
+              deadLetterExchange: deadDirectExchange,
+              deadLetterRoutingKey: msg.routingKey,
+              messageTtl: 60000,
+            });
+
+            await channel.assertExchange(deadDirectExchange, 'direct');
+
             await channel.bindQueue(
-              waitQueueName,
-              preRetryExchange,
-              msg.getRoutingKey(),
+              deadQueueName,
+              deadDirectExchange,
+              msg.routingKey,
             );
+
             queueBindingThatRunLast.push((channel: Channel) =>
-              channel.bindQueue(queueName, retryExchange, msg.getRoutingKey()),
+              channel.bindQueue(queueName, deadDirectExchange, msg.routingKey),
             );
           }
         }
@@ -110,14 +102,18 @@ export class MqModule extends RabbitMQModule implements OnApplicationBootstrap {
         this.connectionsManager
           .getConnections()[0]
           .managedChannel.addSetup(async (channel: Channel, done) => {
-            // await new Promise((resolve) => setTimeout(resolve, 5000));
             for (const index in queueBindingThatRunLast) {
               await queueBindingThatRunLast[index](channel);
             }
             done();
+          })
+          .then(() => {
+            Logger.log('Setup connection rmq');
           });
 
-        super.onApplicationBootstrap();
+        super
+          .onApplicationBootstrap()
+          .then(() => Logger.log('On Application Bootstrap Rmq'));
 
         done();
       } catch (e) {
